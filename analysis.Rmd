@@ -1,0 +1,235 @@
+---
+title: "16S rRNA amplicon analysis: DADA2 to phyloseq"
+subtitle: "Mouse gut microbiome, early vs late post-weaning (MiSeq SOP dataset)"
+author: "Ahmed Hamdy"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 5)
+set.seed(123)
+# Set to FALSE on Windows (DADA2 multithreading is not supported there)
+use_threads <- TRUE
+```
+
+## 1. Question and data
+
+**Question:** does the gut microbiome of one mouse differ between early
+post-weaning (days 0-9) and late (days 141-150)?
+
+**Data:** the public mothur MiSeq SOP dataset (Kozich et al. 2013): 2x250 bp
+paired-end reads of the 16S V4 region, 19 faecal samples plus one mock
+community with a known composition. These are raw FASTQ files.
+
+All samples come from a single mouse over time, so the samples are not
+independent. Statistical tests below are descriptive, not population-level inference.
+
+```{r libs}
+library(dada2)
+library(phyloseq)
+library(Biostrings)
+library(vegan)
+library(DESeq2)
+library(ggplot2)
+library(dplyr)
+```
+
+## 2. Download raw data and reference database
+
+```{r download}
+dir.create("data", showWarnings = FALSE)
+
+if (length(list.files("data", pattern = "_R1_001.fastq", recursive = TRUE)) == 0) {
+  download.file("https://mothur.s3.us-east-2.amazonaws.com/wiki/miseqsopdata.zip",
+                "data/miseqsopdata.zip", mode = "wb")
+  unzip("data/miseqsopdata.zip", exdir = "data")
+}
+
+silva <- "data/silva_nr99_v138.1_train_set.fa.gz"
+if (!file.exists(silva)) {
+  download.file("https://zenodo.org/records/4587955/files/silva_nr99_v138.1_train_set.fa.gz?download=1",
+                silva, mode = "wb")
+}
+
+fnFs <- sort(list.files("data", pattern = "_R1_001.fastq", recursive = TRUE, full.names = TRUE))
+fnRs <- sort(list.files("data", pattern = "_R2_001.fastq", recursive = TRUE, full.names = TRUE))
+fnFs <- fnFs[!grepl("__MACOSX", fnFs)]
+fnRs <- fnRs[!grepl("__MACOSX", fnRs)]
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+length(fnFs)
+sample.names
+```
+
+## 3. Quality inspection
+
+```{r quality}
+plotQualityProfile(fnFs[1:4])
+plotQualityProfile(fnRs[1:4])
+```
+
+Reverse reads degrade earlier than forward reads, so they are truncated more
+aggressively below.
+
+## 4. Filter and trim
+
+```{r filter}
+dir.create("filtered", showWarnings = FALSE)
+filtFs <- file.path("filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path("filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs,
+                     truncLen = c(240, 160), maxN = 0, maxEE = c(2, 2),
+                     truncQ = 2, rm.phix = TRUE, compress = TRUE,
+                     multithread = use_threads)
+head(out)
+```
+
+## 5. Denoise, merge, remove chimeras
+
+```{r dada}
+errF <- learnErrors(filtFs, multithread = use_threads)
+errR <- learnErrors(filtRs, multithread = use_threads)
+plotErrors(errF, nominalQ = TRUE)
+
+dadaFs <- dada(filtFs, err = errF, multithread = use_threads)
+dadaRs <- dada(filtRs, err = errR, multithread = use_threads)
+
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs)
+seqtab <- makeSequenceTable(mergers)
+seqtab.nochim <- removeBimeraDenovo(seqtab, method = "consensus",
+                                    multithread = use_threads)
+
+dim(seqtab.nochim)
+sum(seqtab.nochim) / sum(seqtab)   # fraction of reads kept after chimera removal
+```
+
+### Read tracking through the pipeline
+
+```{r track}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN),
+               sapply(mergers, getN), rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR",
+                     "merged", "nonchim")
+rownames(track) <- sample.names
+track
+```
+
+## 6. Accuracy check on the mock community
+
+```{r mock}
+mock.ref.file <- list.files("data", pattern = "HMP_MOCK", recursive = TRUE, full.names = TRUE)[1]
+mock.ref <- getSequences(mock.ref.file)
+
+unqs.mock <- seqtab.nochim["Mock", ]
+unqs.mock <- sort(unqs.mock[unqs.mock > 0], decreasing = TRUE)
+cat("DADA2 inferred", length(unqs.mock), "sequence variants in the mock community.\n")
+
+match.ref <- sum(sapply(names(unqs.mock), function(x) any(grepl(x, mock.ref))))
+cat("Of those,", match.ref, "matched exactly to expected reference sequences.\n")
+```
+
+## 7. Taxonomy and phyloseq object
+
+```{r taxa}
+taxa <- assignTaxonomy(seqtab.nochim, silva, multithread = use_threads)
+
+samples.out <- rownames(seqtab.nochim)
+subject <- sapply(strsplit(samples.out, "D"), `[`, 1)
+day <- as.integer(sapply(strsplit(samples.out, "D"), `[`, 2))
+samdf <- data.frame(Subject = subject, Day = day, row.names = samples.out)
+samdf$When <- ifelse(samdf$Day > 100, "Late", "Early")
+
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows = FALSE),
+               sample_data(samdf), tax_table(taxa))
+ps <- prune_samples(sample_names(ps) != "Mock", ps)
+ps <- subset_taxa(ps, Kingdom == "Bacteria" & !is.na(Phylum))
+# Remove mitochondrial and chloroplast sequences (not part of the gut community)
+ps <- subset_taxa(ps, (is.na(Family) | Family != "Mitochondria") &
+                      (is.na(Class) | Class != "Chloroplast"))
+ps <- prune_taxa(taxa_sums(ps) > 0, ps)
+
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+ps
+```
+
+## 8. Composition
+
+```{r composition}
+ps.prop <- transform_sample_counts(ps, function(x) x / sum(x))
+top20 <- names(sort(taxa_sums(ps.prop), decreasing = TRUE))[1:20]
+plot_bar(prune_taxa(top20, ps.prop), x = "Day", fill = "Family") +
+  facet_wrap(~When, scales = "free_x") +
+  labs(y = "Relative abundance", title = "Top 20 ASVs by Family")
+```
+
+## 9. Alpha diversity
+
+```{r alpha}
+alpha <- estimate_richness(ps, measures = c("Observed", "Shannon"))
+alpha$When <- sample_data(ps)$When
+
+plot_richness(ps, x = "When", measures = c("Observed", "Shannon")) +
+  geom_boxplot(aes(fill = When), alpha = 0.4)
+
+wilcox.test(Shannon ~ When, data = alpha)
+wilcox.test(Observed ~ When, data = alpha)
+```
+
+## 10. Beta diversity
+
+```{r beta}
+ord <- ordinate(ps.prop, method = "PCoA", distance = "bray")
+plot_ordination(ps.prop, ord, color = "When") +
+  geom_point(size = 3) + stat_ellipse() +
+  labs(title = "PCoA, Bray-Curtis")
+
+bray <- phyloseq::distance(ps.prop, method = "bray")
+meta <- data.frame(sample_data(ps.prop))
+adonis2(bray ~ When, data = meta, permutations = 999)
+
+# Check the dispersion assumption of PERMANOVA
+anova(betadisper(bray, meta$When))
+```
+
+## 11. Differential abundance (DESeq2)
+
+```{r deseq}
+dds <- phyloseq_to_deseq2(ps, ~ When)
+dds <- DESeq(dds, sfType = "poscounts")
+res <- results(dds, contrast = c("When", "Late", "Early"), alpha = 0.01)
+
+sigtab <- as.data.frame(res[which(res$padj < 0.01), ])
+sigtab <- cbind(sigtab, as.data.frame(tax_table(ps)[rownames(sigtab), ]))
+sigtab <- sigtab[order(sigtab$log2FoldChange), ]
+nrow(sigtab)
+
+ggplot(sigtab, aes(x = reorder(rownames(sigtab), log2FoldChange),
+                   y = log2FoldChange, fill = Family)) +
+  geom_col() + coord_flip() +
+  labs(x = "ASV", y = "log2 fold change (Late vs Early)")
+```
+
+## 12. Limitations
+
+- One mouse sampled repeatedly: samples are autocorrelated, so p-values are
+  descriptive. A real study would need multiple independent animals.
+- ASVs are compared by relative change only (compositional data).
+- Taxonomy is only as good as SILVA v138.1 at genus level for a ~250 bp V4 region.
+
+## 13. Reproducibility
+
+```{r session}
+sessionInfo()
+```
